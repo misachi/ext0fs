@@ -3,12 +3,13 @@ Filesystem based on extended filesystem. EXT0fs does not have full functionality
 
 EXT0-fs depends on older linux version(v4.x). The VM base image in the Vagrantfile already runs this version.
 
-The entire system is mapped into block groups of fixed sizes. Each group has the superblock as the first block. The block descriptor follows the superblock, which is then followed by the inode block. The bitmap block follows the inode block. Data blocks follow next. Each block group has 12 data blocks by default. The root directory is by default the 2 inode or block group.
+The entire filesystem is mapped into block groups of fixed sizes. Each group has the superblock as the first block. The block descriptor follows the superblock, which is then followed by the inode block. The bitmap block follows the inode block. Data blocks follow next. Each block group has 12 data blocks by default. The root directory is by default the 2 inode or block group.
+
 There is only one inode per block group and one descriptor block per group. The superblock is at exactly 1024 bytes from the start of the device blocks/sector.
 
 DO NOT run directly on your machine. This is so that you do not brick your system. The recommended way to install is inside a VM. A dummy Vagrantfile is provided to easily provision one locally.
 
-##Setting up
+## Setting up
 Clone the source
 ```
 git clone https://github.com/misachi/ext0fs.git
