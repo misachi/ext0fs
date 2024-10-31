@@ -6,13 +6,64 @@
 
 #include "ext0.h"
 
-static int ext0_writepage(struct page *page, struct writeback_control *wbc);
-static int ext0_readpage(struct file *file, struct page *page);
-static int ext0_readpages(struct file *file, struct address_space *mapping,
-                          struct list_head *pages, unsigned nr_pages);
+static void ext0_write_failed(struct address_space *mapping, loff_t to)
+{
+    struct inode *inode = mapping->host;
+
+    if (to > inode->i_size)
+    {
+        truncate_pagecache(inode, inode->i_size);
+        // ext0_truncate(inode);
+    }
+}
+
+static int ext0_writepage(struct page *page, struct writeback_control *wbc)
+{
+    return block_write_full_page(page, ext0_get_block, wbc);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+
+static int ext0_read_folio(struct file *file, struct folio *folio)
+{
+    return mpage_read_folio(folio, ext0_get_block);
+}
+
+static int ext0_write_begin(struct file *file, struct address_space *mapping,
+                            loff_t pos, unsigned len, struct page **pagep, void **fsdata)
+{
+    int ret;
+    ret = block_write_begin(mapping, pos, len, pagep, ext0_get_block);
+    if (EXT0_IS_ERR(ret))
+        ext0_write_failed(mapping, pos + len);
+    return ret;
+}
+
+#else
+
 static int ext0_write_begin(struct file *file, struct address_space *mapping,
                             loff_t pos, unsigned len, unsigned flags,
-                            struct page **pagep, void **fsdata);
+                            struct page **pagep, void **fsdata)
+{
+    int ret;
+    ret = block_write_begin(mapping, pos, len, flags, pagep, ext0_get_block);
+    if (EXT0_IS_ERR(ret))
+        ext0_write_failed(mapping, pos + len);
+    return ret;
+}
+
+static int ext0_readpage(struct file *file, struct page *page)
+{
+    return mpage_readpage(page, ext0_get_block);
+}
+
+static int ext0_readpages(struct file *file, struct address_space *mapping,
+                          struct list_head *pages, unsigned nr_pages)
+{
+    return mpage_readpages(mapping, pages, nr_pages, ext0_get_block);
+}
+#endif
+
 static int ext0_write_end(struct file *file, struct address_space *mapping,
                           loff_t pos, unsigned len, unsigned copied,
                           struct page *page, void *fsdata);
@@ -47,7 +98,7 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
 
     spin_lock(&in_mem_sb->s_lock);
 
-    ext0_debug("Now here we are=> iblock: %zu, create: %i, ino: %lu, grp desc first block: %u: root directory ino: %u, name: %s", iblock, create, inode->i_ino, gdesc->bg_first_block, de->inode, de->name);
+    ext0_debug("Now here we are=> iblock: %llu, create: %i, ino: %lu, grp desc first block: %u: root directory ino: %u, name: %s", iblock, create, inode->i_ino, gdesc->bg_first_block, de->inode, de->name);
 
     phys_start = gdesc->bg_first_block + iblock - 1;
     if (!create)
@@ -59,7 +110,7 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
 
     if (inode->i_blocks < (iblock + 1))
     {
-        ext0_debug("Invalid block number: %zu", iblock);
+        ext0_debug("Invalid block number: %llu", iblock);
         spin_unlock(&in_mem_sb->s_lock);
         return -ENOSPC;
     }
@@ -71,55 +122,33 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
 }
 
 const struct address_space_operations ext0_aops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+    .read_folio = ext0_read_folio,
+    .dirty_folio = block_dirty_folio,
+    .invalidate_folio = block_invalidate_folio,
+    .error_remove_folio = generic_error_remove_folio,
+    .migrate_folio = buffer_migrate_folio,
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+    .read_folio = ext0_read_folio,
+    .dirty_folio = block_dirty_folio,
+    .invalidate_folio = block_invalidate_folio,
+    .error_remove_page	= generic_error_remove_page,
+    .migrate_folio = buffer_migrate_folio,
+#else
     .readpage = ext0_readpage,
     .readpages = ext0_readpages,
+    .writepage = ext0_writepage,
+    .error_remove_page = generic_error_remove_page,
+    .migratepage = buffer_migrate_page,
+#endif
+
     .writepage = ext0_writepage,
     .write_begin = ext0_write_begin,
     .write_end = ext0_write_end,
     .bmap = ext0_bmap,
     .writepages = ext0_writepages,
-    .migratepage = buffer_migrate_page,
     .is_partially_uptodate = block_is_partially_uptodate,
-    .error_remove_page = generic_error_remove_page,
 };
-
-static void ext0_write_failed(struct address_space *mapping, loff_t to)
-{
-    struct inode *inode = mapping->host;
-
-    if (to > inode->i_size)
-    {
-        truncate_pagecache(inode, inode->i_size);
-        // ext0_truncate(inode);
-    }
-}
-
-static int ext0_writepage(struct page *page, struct writeback_control *wbc)
-{
-    return block_write_full_page(page, ext0_get_block, wbc);
-}
-
-static int ext0_readpage(struct file *file, struct page *page)
-{
-    return mpage_readpage(page, ext0_get_block);
-}
-
-static int ext0_readpages(struct file *file, struct address_space *mapping,
-                          struct list_head *pages, unsigned nr_pages)
-{
-    return mpage_readpages(mapping, pages, nr_pages, ext0_get_block);
-}
-
-static int ext0_write_begin(struct file *file, struct address_space *mapping,
-                            loff_t pos, unsigned len, unsigned flags,
-                            struct page **pagep, void **fsdata)
-{
-    int ret;
-    ret = block_write_begin(mapping, pos, len, flags, pagep, ext0_get_block);
-    if (EXT0_IS_ERR(ret))
-        ext0_write_failed(mapping, pos + len);
-    return ret;
-}
 
 static int ext0_write_end(struct file *file, struct address_space *mapping,
                           loff_t pos, unsigned len, unsigned copied,

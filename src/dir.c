@@ -3,21 +3,6 @@
 
 #include "ext0.h"
 
-static inline void ext0_put_page(struct page *page)
-{
-	kunmap(page);
-	put_page(page);
-}
-
-static struct page *ext0_get_page(struct inode *dir, unsigned long n)
-{
-	struct address_space *mapping = dir->i_mapping;
-	struct page *page = read_mapping_page(mapping, n, NULL);
-	if (!IS_ERR(page))
-		kmap(page);
-	return page;
-}
-
 static int ext0_create_inode(struct inode *dir, struct dentry *dentry, umode_t mode, struct inode **ret_inode)
 {
 	struct super_block *sb = dir->i_sb;
@@ -74,13 +59,918 @@ retry:
 	in_mem_inode = EXT0_I(inode);
 	in_mem_inode->i_flags = inode->i_flags;
 
-	memset(in_mem_inode->i_data, 0, EXT0_FS_MAX_DIRECT_BLOCKS);
+	memset(in_mem_inode->i_data, 0, EXT0_FS_MAX_DIRECT_BLOCKS * sizeof(__u32));
 	in_mem_inode->i_state = inode->i_state;
 	in_mem_inode->i_block_group = EXT0_GET_INO(inode->i_ino);
 
 	mark_inode_dirty(inode);
 	*ret_inode = inode;
 	return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+static inline void ext0_put_folio(struct folio *folio, void *addr)
+{
+	folio_release_kmap(folio, addr);
+}
+
+static void *ext0_get_folio(struct inode *dir, unsigned long n, struct folio **foliop)
+{
+	struct address_space *mapping = dir->i_mapping;
+	struct folio *folio = read_mapping_folio(mapping, n, NULL);
+	void *kaddr;
+	if (!IS_ERR(folio))
+	{
+		kaddr = kmap_local_folio(folio, 0);
+		*foliop = folio;
+		return kaddr;
+	}
+	folio_release_kmap(folio, kaddr);
+	return ERR_PTR(-EIO);
+}
+
+static int ext0_new_inode(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct inode *inode = NULL;
+	int ret;
+
+	ret = ext0_create_inode(dir, dentry, mode, &inode);
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		return ret;
+	}
+	unlock_new_inode(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static int ext0_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode = NULL;
+	int ret = ext0_create_inode(dir, dentry, mode, &inode);
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		return ret;
+	}
+	unlock_new_inode(inode);
+	d_tmpfile(dentry, inode);
+	return 0;
+}
+
+static int ext0_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
+{
+	struct inode *inode = NULL;
+	int ret = ext0_create_inode(dir, dentry, mode, &inode);
+	if (!EXT0_IS_ERR(ret))
+	{
+		init_special_inode(inode, inode->i_mode, rdev);
+		mark_inode_dirty(inode);
+		unlock_new_inode(inode);
+		d_instantiate(dentry, inode);
+	}
+	return ret;
+}
+
+static int ext0_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *symname)
+{
+	struct inode *inode = NULL;
+	int ret = ext0_create_inode(dir, dentry, S_IFLNK | 0777, &inode);
+	int i = strlen(symname) + 1;
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		return ret;
+	}
+
+	ret = page_symlink(inode, symname, i);
+	if (ret)
+	{
+		inode_dec_link_count(inode);
+		iput(inode);
+		return ret;
+	}
+
+	inode_inc_link_count(inode);
+	mark_inode_dirty(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static int link_dir(struct inode *inode, struct dentry *dentry)
+{
+	unsigned long npages = dir_pages(inode);
+	// struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = 0; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		struct folio *folio;
+		char *kaddr = ext0_get_folio(inode, i, &folio);
+
+		// page = ext0_get_page(inode, i);
+		if (!folio)
+		{
+			ext0_debug("Invalid page while reading directory contents: page id=%zu", i);
+			continue;
+		}
+		// kaddr = (char *)page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+
+			/* Ensure we have enough free space */
+			if (!de->inode && ((dentry->d_name.len + EXT0_DIR_SIZE) <= (page_end - page_off)))
+			{
+				de = (struct ext0_dir_entry *)(kaddr + page_off);
+				de->name_len = dentry->d_name.len;
+				de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
+				memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
+				de->inode = cpu_to_le32(inode->i_ino);
+				de->file_type = DT_DIR;
+
+				inode->i_size += de->rec_len;
+				mark_inode_dirty(inode);
+				return 0;
+			}
+
+			page_off += de->rec_len;
+		}
+
+		ext0_put_page(folio, kaddr);
+	}
+	return -ENOSPC; /* We need to map new pages in */
+}
+
+static int ext0_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode = NULL;
+	struct buffer_head *bitmap_bh, *gdesc_bh;
+	struct ext0_block_descriptor *gdesc;
+	struct super_block *sb = dir->i_sb;
+	struct ext0_super_block_info *in_mem_sb = EXT0_SB(sb);
+	int ret;
+	off_t offset;
+	char *bitmap_data;
+	// struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned chunk_size = sb->s_blocksize;
+	void *kaddr;
+	struct folio *folio = filemap_grab_folio(inode->i_mapping, 0);
+	unsigned long blk_no = 0;
+
+	inode_inc_link_count(dir);
+
+	ret = ext0_create_inode(dir, dentry, S_IFDIR | mode, &inode);
+	if (EXT0_IS_ERR(ret) || !inode)
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		inode_dec_link_count(dir);
+		return ret;
+	}
+
+	inode_inc_link_count(inode);
+
+	/* Create default directory contents */
+	// page = grab_cache_page(inode->i_mapping, 0);
+	if (IS_ERR(folio))
+	{
+		ext0_debug("Could not get any pages: %i", (int)0);
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	ret = __block_write_begin(&folio->page, 0, chunk_size, ext0_get_block);
+	if (ret)
+	{
+		ext0_debug("Failed preparing page for write: %i", ret);
+		folio_unlock(folio);
+		goto page_err;
+	}
+
+	kaddr = kmap_local_folio(folio, 0);
+	memset(kaddr, 0, chunk_size);
+
+	de = (struct ext0_dir_entry *)kaddr;
+	de->name_len = 1;
+	de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
+	memcpy(de->name, ".", 2);
+	de->inode = cpu_to_le32(inode->i_ino);
+	de->file_type = DT_DIR;
+
+	inode->i_size += de->rec_len;
+
+	de = (struct ext0_dir_entry *)(kaddr + de->rec_len);
+	de->name_len = 2;
+	de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
+	memcpy(de->name, "..", 3);
+	de->inode = cpu_to_le32(dir->i_ino);
+	de->file_type = DT_DIR;
+
+	inode->i_size += de->rec_len;
+	mark_inode_dirty(inode);
+
+	ret = link_dir(dir, dentry);
+	if (EXT0_IS_ERR(ret))
+	{
+		goto k_err;
+	}
+	kunmap_local(kaddr);
+	block_write_end(NULL, inode->i_mapping, 0, chunk_size, chunk_size, &folio->page, NULL);
+	/* Default directory contents creation done */
+
+	offset = 0;
+	blk_no = ext0_inode_block(dir->i_ino) - 1;
+	if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
+		fs_to_dev_block_num(sb, blk_no, &offset);
+
+	gdesc_bh = in_mem_sb->s_group_desc[EXT0_GET_INO(dir->i_ino)];
+	gdesc = (struct ext0_block_descriptor *)(gdesc_bh->b_data + offset);
+
+	offset = 0;
+	blk_no = 0;
+	if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
+		blk_no = fs_to_dev_block_num(sb, gdesc->bg_block_bitmap, &offset);
+
+	bitmap_bh = sb_bread(sb, blk_no);
+	if (!bitmap_bh)
+	{
+		ext0_debug("Could not perform I/O for block bitmap: %zu, orig: %i", blk_no, gdesc->bg_block_bitmap);
+		ret = -EIO;
+		goto page_err;
+	}
+	bitmap_data = bitmap_bh->b_data + offset;
+
+	folio_unlock(folio);
+
+	mark_buffer_dirty(bitmap_bh);
+
+	unlock_new_inode(inode);
+	d_instantiate(dentry, inode);
+
+	folio_put(folio);
+
+	return 0;
+
+k_err:
+	kunmap_local(kaddr);
+
+page_err:
+	folio_unlock(folio);
+
+err:
+	inode_dec_link_count(inode);
+	inode_dec_link_count(dir);
+	iput(inode);
+	return ret;
+}
+
+static int ext0_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
+					   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
+{
+	return 0;
+}
+
+static int ext0_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct page *page = NULL;
+	struct inode *inode = dir;
+	unsigned long npages = dir_pages(dir);
+	struct ext0_dir_entry *de;
+	int ret;
+	unsigned long i;
+
+	for (i = 0; i < npages; i++)
+	{
+		struct folio *folio;
+		char *kaddr = ext0_get_folio(inode, i, &folio);
+		unsigned long page_off = 0, page_end;
+
+		// page = ext0_get_page(inode, i);
+		if (!folio)
+		{
+			ext0_debug("Invalid page for directory entry unlinking: page id=%zu", i);
+			continue;
+		}
+		// kaddr = page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			unsigned long chunk_size;
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT;
+				continue;
+			}
+
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (memcmp(de->name, dentry->d_name.name, dentry->d_name.len) == 0)
+			{
+				chunk_size = page_end - page_off;
+				folio_lock(folio);
+				ret = __block_write_begin(&folio->page, page_off, chunk_size, ext0_get_block);
+				if (ret)
+				{
+					ext0_debug("Failed preparing page for deletion: %i", ret);
+					folio_unlock(folio);
+					ext0_put_page(folio, kaddr);
+					return ret;
+				}
+				de->inode = 0;
+				block_write_end(NULL, inode->i_mapping, page_off, chunk_size, chunk_size, &folio->page, NULL);
+
+				if ((page_off + chunk_size) > dir->i_size)
+				{
+					i_size_write(dir, page_off + chunk_size);
+					mark_inode_dirty(dir);
+				}
+
+				folio_unlock(folio);
+				inode->i_ctime = inode->i_mtime = current_time(inode);
+				goto found;
+			}
+			page_off += de->rec_len;
+		}
+
+		ext0_put_page(folio, kaddr);
+	}
+
+found:
+	inode_dec_link_count(inode);
+	mark_inode_dirty(inode);
+	return 0;
+}
+
+static int ext0_readdir(struct file *file, struct dir_context *ctx)
+{
+	struct inode *inode = file->f_inode;
+	unsigned long npages = dir_pages(inode);
+	// struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = ctx->pos; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		struct folio *folio;
+		char *kaddr = ext0_get_folio(inode, i, &folio);
+
+		// page = ext0_get_page(inode, i);
+		if (!folio)
+		{
+			ext0_debug("Invalid page while reading directory contents: page id=%zu", i);
+			ctx->pos += PAGE_SIZE;
+			continue;
+		}
+		// kaddr = (char *)page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT; /* Too small jumps. Needs better approach */
+				continue;
+			}
+
+			/* Deleted entry or unoccupied? */
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (!dir_emit(ctx, de->name, de->name_len, le32_to_cpu(de->inode), le32_to_cpu(de->file_type)))
+			{
+				ext0_put_page(folio, de);
+				return 0;
+			}
+
+			page_off += de->rec_len;
+			ctx->pos += de->rec_len;
+		}
+		ext0_put_page(folio, kaddr);
+	}
+
+	return 0;
+}
+
+static int ext0_inode_by_name(struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry->d_parent);
+	unsigned long npages = dir_pages(inode);
+	// struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = 0; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		struct folio *folio;
+		char *kaddr = ext0_get_folio(inode, i, &folio);
+
+		// page = ext0_get_page(inode, i);
+		if (!folio)
+		{
+			ext0_debug("Invalid page in directory lookup id=%zu", i);
+			continue;
+		}
+		// kaddr = page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT;
+				continue;
+			}
+
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (memcmp(de->name, dentry->d_name.name, dentry->d_name.len) == 0)
+			{
+				return le32_to_cpu(de->inode);
+			}
+			page_off += de->rec_len;
+		}
+		ext0_put_page(folio, kaddr);
+	}
+	return 0;
+}
+
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+static inline void ext0_put_page(struct page *page, void *addr)
+{
+	kunmap_local(addr);
+	put_page(page);
+}
+
+static struct page *ext0_get_page(struct inode *dir, unsigned long n, void **kaddr)
+{
+	struct address_space *mapping = dir->i_mapping;
+	struct folio *folio = read_mapping_folio(mapping, n, NULL);
+	if (IS_ERR(folio))
+		return &folio->page;
+	*kaddr = kmap_local_folio(folio, n & (folio_nr_pages(folio) - 1));
+	return &folio->page;
+}
+
+static int ext0_new_inode(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct inode *inode = NULL;
+	int ret;
+
+	ret = ext0_create_inode(dir, dentry, mode, &inode);
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		return ret;
+	}
+	unlock_new_inode(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static int ext0_tmpfile(struct user_namespace *mnt_userns, struct inode *dir, struct file *file, umode_t mode)
+{
+	struct inode *inode = NULL;
+	int ret = ext0_create_inode(dir, NULL, mode, &inode);
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		return ret;
+	}
+	d_tmpfile(file, inode);
+	unlock_new_inode(inode);
+	return finish_open_simple(file, 0);
+}
+
+static int ext0_mknod(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
+{
+	struct inode *inode = NULL;
+	int ret = ext0_create_inode(dir, dentry, mode, &inode);
+	if (!EXT0_IS_ERR(ret))
+	{
+		init_special_inode(inode, inode->i_mode, rdev);
+		mark_inode_dirty(inode);
+		unlock_new_inode(inode);
+		d_instantiate(dentry, inode);
+	}
+	return ret;
+}
+
+static int ext0_symlink(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, const char *symname)
+{
+	struct inode *inode = NULL;
+	int ret = ext0_create_inode(dir, dentry, S_IFLNK | 0777, &inode);
+	int i = strlen(symname) + 1;
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		return ret;
+	}
+
+	ret = page_symlink(inode, symname, i);
+	if (ret)
+	{
+		inode_dec_link_count(inode);
+		iput(inode);
+		return ret;
+	}
+
+	inode_inc_link_count(inode);
+	mark_inode_dirty(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static int link_dir(struct inode *inode, struct dentry *dentry)
+{
+	unsigned long npages = dir_pages(inode);
+	struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = 0; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		void *kaddr;
+
+		page = ext0_get_page(inode, i, &kaddr);
+		if (!page)
+		{
+			ext0_debug("Invalid page while reading directory contents: page id=%zu", i);
+			continue;
+		}
+		// kaddr = (char *)page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+
+			/* Ensure we have enough free space */
+			if (!de->inode && ((dentry->d_name.len + EXT0_DIR_SIZE) <= (page_end - page_off)))
+			{
+				de = (struct ext0_dir_entry *)(kaddr + page_off);
+				de->name_len = dentry->d_name.len;
+				de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
+				memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
+				de->inode = cpu_to_le32(inode->i_ino);
+				de->file_type = DT_DIR;
+
+				inode->i_size += de->rec_len;
+				mark_inode_dirty(inode);
+				return 0;
+			}
+
+			page_off += de->rec_len;
+		}
+
+		ext0_put_page(page, kaddr);
+	}
+	return -ENOSPC; /* We need to map new pages in */
+}
+
+static int ext0_mkdir(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode = NULL;
+	struct buffer_head *bitmap_bh, *gdesc_bh;
+	struct ext0_block_descriptor *gdesc;
+	struct super_block *sb = dir->i_sb;
+	struct ext0_super_block_info *in_mem_sb = EXT0_SB(sb);
+	int ret;
+	off_t offset;
+	char *bitmap_data;
+	struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned chunk_size = sb->s_blocksize;
+	void *kaddr;
+	unsigned long blk_no = 0;
+
+	inode_inc_link_count(dir);
+
+	ret = ext0_create_inode(dir, dentry, S_IFDIR | mode, &inode);
+	if (EXT0_IS_ERR(ret) || !inode)
+	{
+		ext0_debug("Unable to create inode: %i", ret);
+		inode_dec_link_count(dir);
+		return ret;
+	}
+
+	inode_inc_link_count(inode);
+
+	/* Create default directory contents */
+	page = grab_cache_page(inode->i_mapping, 0);
+	if (!page)
+	{
+		ext0_debug("Could not get any pages: %i", (int)0);
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	ret = __block_write_begin(page, 0, chunk_size, ext0_get_block);
+	if (ret)
+	{
+		ext0_debug("Failed preparing page for write: %i", ret);
+		goto page_err;
+	}
+
+	kaddr = kmap_atomic(page);
+	memset(kaddr, 0, chunk_size);
+
+	de = (struct ext0_dir_entry *)kaddr;
+	de->name_len = 1;
+	de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
+	memcpy(de->name, ".", 2);
+	de->inode = cpu_to_le32(inode->i_ino);
+	de->file_type = DT_DIR;
+
+	inode->i_size += de->rec_len;
+
+	de = (struct ext0_dir_entry *)(kaddr + de->rec_len);
+	de->name_len = 2;
+	de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
+	memcpy(de->name, "..", 3);
+	de->inode = cpu_to_le32(dir->i_ino);
+	de->file_type = DT_DIR;
+
+	inode->i_size += de->rec_len;
+	mark_inode_dirty(inode);
+
+	ret = link_dir(dir, dentry);
+	if (EXT0_IS_ERR(ret))
+	{
+		goto k_err;
+	}
+	kunmap_atomic(kaddr);
+	block_write_end(NULL, inode->i_mapping, 0, chunk_size, chunk_size, page, NULL);
+	/* Default directory contents creation done */
+
+	offset = 0;
+	blk_no = ext0_inode_block(dir->i_ino) - 1;
+	if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
+		fs_to_dev_block_num(sb, blk_no, &offset);
+
+	gdesc_bh = in_mem_sb->s_group_desc[EXT0_GET_INO(dir->i_ino)];
+	gdesc = (struct ext0_block_descriptor *)(gdesc_bh->b_data + offset);
+
+	offset = 0;
+	blk_no = 0;
+	if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
+		blk_no = fs_to_dev_block_num(sb, gdesc->bg_block_bitmap, &offset);
+
+	bitmap_bh = sb_bread(sb, blk_no);
+	if (!bitmap_bh)
+	{
+		ext0_debug("Could not perform I/O for block bitmap: %zu, orig: %i", blk_no, gdesc->bg_block_bitmap);
+		ret = -EIO;
+		goto page_err;
+	}
+	bitmap_data = bitmap_bh->b_data + offset;
+
+	unlock_page(page);
+
+	mark_buffer_dirty(bitmap_bh);
+
+	unlock_new_inode(inode);
+	d_instantiate(dentry, inode);
+
+	put_page(page);
+
+	return 0;
+
+k_err:
+	kunmap_atomic(kaddr);
+
+page_err:
+	unlock_page(page);
+
+err:
+	inode_dec_link_count(inode);
+	inode_dec_link_count(dir);
+	iput(inode);
+	return ret;
+}
+
+static int ext0_rename(struct user_namespace * mnt_userns, struct inode *old_dir, struct dentry *old_dentry,
+					   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
+{
+	return 0;
+}
+
+static int ext0_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct page *page = NULL;
+	struct inode *inode = dir;
+	unsigned long npages = dir_pages(dir);
+	struct ext0_dir_entry *de;
+	int ret;
+	unsigned long i;
+	void *page_addr;
+
+	for (i = 0; i < npages; i++)
+	{
+		void *kaddr;
+		unsigned long page_off = 0, page_end;
+
+		page = ext0_get_page(inode, i, &page_addr);
+		if (!page)
+		{
+			ext0_debug("Invalid page for directory entry unlinking: page id=%zu", i);
+			continue;
+		}
+		kaddr = page_addr;
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			unsigned long chunk_size;
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT;
+				continue;
+			}
+
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (memcmp(de->name, dentry->d_name.name, dentry->d_name.len) == 0)
+			{
+				chunk_size = page_end - page_off;
+				lock_page(page);
+				ret = __block_write_begin(page, page_off, chunk_size, ext0_get_block);
+				if (ret)
+				{
+					ext0_debug("Failed preparing page for deletion: %i", ret);
+					unlock_page(page);
+					goto out;
+				}
+				de->inode = 0;
+				block_write_end(NULL, inode->i_mapping, page_off, chunk_size, chunk_size, page, NULL);
+
+				if ((page_off + chunk_size) > dir->i_size)
+				{
+					i_size_write(dir, page_off + chunk_size);
+					mark_inode_dirty(dir);
+				}
+
+				unlock_page(page);
+				inode->i_ctime = inode->i_mtime = current_time(inode);
+			}
+			page_off += de->rec_len;
+		}
+
+		ext0_put_page(page, kaddr);
+	}
+
+	inode_inc_link_count(inode);
+	mark_inode_dirty(inode);
+	return 0;
+out:
+	ext0_put_page(page, page_addr);
+	return ret;
+}
+
+static int ext0_readdir(struct file *file, struct dir_context *ctx)
+{
+	struct inode *inode = file->f_inode;
+	unsigned long npages = dir_pages(inode);
+	struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = ctx->pos; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		void *kaddr;
+
+		page = ext0_get_page(inode, i, &kaddr);
+		if (!page)
+		{
+			ext0_debug("Invalid page while reading directory contents: page id=%zu", i);
+			ctx->pos += PAGE_SIZE;
+			continue;
+		}
+		// kaddr = (char *)page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT; /* Too small jumps. Needs better approach */
+				continue;
+			}
+
+			/* Deleted entry or unoccupied? */
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (!dir_emit(ctx, de->name, de->name_len, le32_to_cpu(de->inode), le32_to_cpu(de->file_type)))
+			{
+				ext0_put_page(page, kaddr);
+				return 0;
+			}
+
+			page_off += de->rec_len;
+			ctx->pos += de->rec_len;
+		}
+		ext0_put_page(page, kaddr);
+	}
+
+	return 0;
+}
+
+static int ext0_inode_by_name(struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry->d_parent);
+	unsigned long npages = dir_pages(inode);
+	struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = 0; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		void *kaddr;
+
+		page = ext0_get_page(inode, i, &kaddr);
+		if (!page)
+		{
+			ext0_debug("Invalid page in directory lookup id=%zu", i);
+			continue;
+		}
+		// kaddr = page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT;
+				continue;
+			}
+
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (memcmp(de->name, dentry->d_name.name, dentry->d_name.len) == 0)
+			{
+				return le32_to_cpu(de->inode);
+			}
+			page_off += de->rec_len;
+		}
+		ext0_put_page(page, kaddr);
+	}
+	return 0;
+}
+
+#else
+static inline void ext0_put_page(struct page *page)
+{
+	kunmap(page);
+	put_page(page);
+}
+
+static struct page *ext0_get_page(struct inode *dir, unsigned long n)
+{
+	struct address_space *mapping = dir->i_mapping;
+	struct page *page = read_mapping_page(mapping, n, NULL);
+	if (!IS_ERR(page))
+		kmap(page);
+	return page;
 }
 
 static int ext0_new_inode(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
@@ -152,16 +1042,6 @@ static int ext0_symlink(struct inode *dir, struct dentry *dentry, const char *sy
 	return 0;
 }
 
-static int ext0_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
-{
-	struct inode *inode = d_inode(old_dentry);
-	inode->i_ctime = current_time(inode);
-	inode_inc_link_count(inode);
-	mark_inode_dirty(inode);
-	d_instantiate(dentry, inode);
-	return 0;
-}
-
 static int link_dir(struct inode *inode, struct dentry *dentry)
 {
 	unsigned long npages = dir_pages(inode);
@@ -196,7 +1076,7 @@ static int link_dir(struct inode *inode, struct dentry *dentry)
 				memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
 				de->inode = cpu_to_le32(inode->i_ino);
 				de->file_type = DT_DIR;
-				
+
 				inode->i_size += de->rec_len;
 				mark_inode_dirty(inode);
 				return 0;
@@ -277,7 +1157,8 @@ static int ext0_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	mark_inode_dirty(inode);
 
 	ret = link_dir(dir, dentry);
-	if (EXT0_IS_ERR(ret)) {
+	if (EXT0_IS_ERR(ret))
+	{
 		goto k_err;
 	}
 	kunmap_atomic(kaddr);
@@ -328,6 +1209,12 @@ err:
 	inode_dec_link_count(dir);
 	iput(inode);
 	return ret;
+}
+
+static int ext0_rename(struct inode *old_dir, struct dentry *old_dentry,
+					   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
+{
+	return 0;
 }
 
 static int ext0_unlink(struct inode *dir, struct dentry *dentry)
@@ -406,87 +1293,6 @@ out:
 	return ret;
 }
 
-static int ext0_rmdir(struct inode *dir, struct dentry *dentry)
-{
-	return 0;
-}
-
-static int ext0_rename(struct inode *old_dir, struct dentry *old_dentry,
-					   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
-{
-	return 0;
-}
-
-static int ext0_inode_by_name(struct dentry *dentry)
-{
-	struct inode *inode = d_inode(dentry->d_parent);
-	unsigned long npages = dir_pages(inode);
-	struct page *page;
-	struct ext0_dir_entry *de;
-	unsigned long i;
-
-	for (i = 0; i < npages; i++)
-	{
-		unsigned long page_off = 0, page_end;
-		void *kaddr;
-
-		page = ext0_get_page(inode, i);
-		if (!page)
-		{
-			ext0_debug("Invalid page in directory lookup id=%zu", i);
-			continue;
-		}
-		kaddr = page_address(page);
-
-		page_end = page_off + PAGE_SIZE;
-		while (page_off < page_end)
-		{
-			de = (struct ext0_dir_entry *)(kaddr + page_off);
-			if (!de->rec_len)
-			{
-				page_off += EXT0_ALIGNMENT;
-				continue;
-			}
-
-			if (!de->inode)
-			{
-				page_off += de->rec_len;
-				continue;
-			}
-
-			if (memcmp(de->name, dentry->d_name.name, dentry->d_name.len) == 0)
-			{
-				return le32_to_cpu(de->inode);
-			}
-			page_off += de->rec_len;
-		}
-		ext0_put_page(page);
-	}
-	return 0;
-}
-
-static struct dentry *ext0_lookup_by_name(struct inode *dir, struct dentry *dentry, unsigned int flags)
-{
-	struct inode *inode;
-	ino_t ino;
-
-	if (dentry->d_name.len > EXT0_NAME_LEN)
-		return ERR_PTR(-ENAMETOOLONG);
-
-	ino = ext0_inode_by_name(dentry);
-	inode = NULL;
-	if (ino)
-	{
-		inode = ext0_iget(dir->i_sb, ino);
-		if (inode == ERR_PTR(-ESTALE))
-		{
-			ext0_debug("deleted inode referenced: %lu", (unsigned long)ino);
-			return ERR_PTR(-EIO);
-		}
-	}
-	return d_splice_alias(inode, dentry);
-}
-
 static int ext0_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file->f_inode;
@@ -538,6 +1344,93 @@ static int ext0_readdir(struct file *file, struct dir_context *ctx)
 		ext0_put_page(page);
 	}
 
+	return 0;
+}
+
+static int ext0_inode_by_name(struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry->d_parent);
+	unsigned long npages = dir_pages(inode);
+	struct page *page;
+	struct ext0_dir_entry *de;
+	unsigned long i;
+
+	for (i = 0; i < npages; i++)
+	{
+		unsigned long page_off = 0, page_end;
+		void *kaddr;
+
+		page = ext0_get_page(inode, i);
+		if (!page)
+		{
+			ext0_debug("Invalid page in directory lookup id=%zu", i);
+			continue;
+		}
+		kaddr = page_address(page);
+
+		page_end = page_off + PAGE_SIZE;
+		while (page_off < page_end)
+		{
+			de = (struct ext0_dir_entry *)(kaddr + page_off);
+			if (!de->rec_len)
+			{
+				page_off += EXT0_ALIGNMENT;
+				continue;
+			}
+
+			if (!de->inode)
+			{
+				page_off += de->rec_len;
+				continue;
+			}
+
+			if (memcmp(de->name, dentry->d_name.name, dentry->d_name.len) == 0)
+			{
+				return le32_to_cpu(de->inode);
+			}
+			page_off += de->rec_len;
+		}
+		ext0_put_page(page);
+	}
+	return 0;
+}
+
+#endif
+
+static struct dentry *ext0_lookup_by_name(struct inode *dir, struct dentry *dentry, unsigned int flags)
+{
+	struct inode *inode;
+	ino_t ino;
+
+	if (dentry->d_name.len > EXT0_NAME_LEN)
+		return ERR_PTR(-ENAMETOOLONG);
+
+	ino = ext0_inode_by_name(dentry);
+	inode = NULL;
+	if (ino)
+	{
+		inode = ext0_iget(dir->i_sb, ino);
+		if (inode == ERR_PTR(-ESTALE))
+		{
+			ext0_debug("deleted inode referenced: %lu", (unsigned long)ino);
+			return ERR_PTR(-EIO);
+		}
+	}
+	return d_splice_alias(inode, dentry);
+}
+
+static int ext0_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	return 0;
+}
+
+static int ext0_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
+{
+	struct inode *inode = d_inode(old_dentry);
+	inode->i_ctime = current_time(inode);
+	inode_inc_link_count(inode);
+	mark_inode_dirty(inode);
+	d_instantiate(dentry, inode);
 	return 0;
 }
 

@@ -2,6 +2,7 @@
 #define _FS_EXT0_FS
 
 #include <linux/fs.h>
+#include <linux/version.h>
 
 #ifdef __KERNEL__
 #include <linux/spinlock_types.h>

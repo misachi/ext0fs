@@ -65,7 +65,7 @@ static int ext0_sync_fs(struct super_block *sb, int wait)
     struct ext0_super_block *on_disk_sb = in_mem_sb->s_es;
 
     spin_lock(&in_mem_sb->s_lock);
-    on_disk_sb->s_wtime = cpu_to_le32(get_seconds());
+    on_disk_sb->s_wtime = cpu_to_le32(ktime_get_real_seconds());
     spin_unlock(&in_mem_sb->s_lock);
 
     mark_buffer_dirty(in_mem_sb->s_sbh);
@@ -278,7 +278,6 @@ static int ext0_fill_super(struct super_block *sb, void *data, int silent)
     sb->s_fs_info = in_mem_sb;
 
     root = ext0_iget(sb, EXT0_ROOT_INO);
-    ext0_debug("Useless value: %zu", root->i_blocks);
     if (!root)
     {
         ext0_debug("Unable to find root directory inode: %i", EXT0_ROOT_INO);

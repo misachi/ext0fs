@@ -1,7 +1,7 @@
 # EXT0-fs
 Filesystem based on extended filesystem. EXT0fs does not have full functionality provided by production-level filesystems, and does not intend to. This is for educational purposes only. 
 
-EXT0-fs depends on older linux version(v4.x). The VM base image in the Vagrantfile already runs this version.
+EXT0-fs has been ran on an older linux version(v4.15). The VM base image in the Vagrantfile already runs this version. It has also been ran on linux v6.2.
 
 The entire filesystem is mapped into block groups of fixed sizes. Each group has the superblock as the first block. The block descriptor follows the superblock, which is then followed by the inode block. The bitmap block follows the inode block. Data blocks follow next. Each block group has 12 data blocks by default. The root directory is by default the 2 inode or block group.
 
