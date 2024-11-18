@@ -12,8 +12,8 @@ all:
 
 build_temp:
 	@mkdir -p $(EXT0_PROJECT)
-	@cp -uR src $(EXT0_PROJECT)
-	@cp Makefile $(EXT0_PROJECT)
+	-cp -R src $(EXT0_PROJECT)
+	-cp Makefile $(EXT0_PROJECT)
 	@cd $(EXT0_PROJECT) && make
 
 install: build_temp
@@ -27,8 +27,8 @@ mount:
 	@mount -o loop=$(LOOP_DEV) -t ext0 $(EXT0_TMP)/test.img $(MOUNT_POINT)
 
 unmount:
-	@umount -t ext0 $(EXT0_PROJECT)/$(MOUNT_POINT)
-	@umount -t ext0 $(MOUNT_POINT)
+	-umount -t ext0 $(EXT0_PROJECT)/$(MOUNT_POINT)
+	-umount -t ext0 $(MOUNT_POINT)
 
 run: mkfs
 	@cd $(EXT0_PROJECT) && $(SRC)/mkfs.ext0 $(EXT0_TMP)/test.img && make mount
