@@ -31,7 +31,7 @@ vagrant ssh
 Next, enable `systemd-networkd` service
 ```
 sudo service systemd-networkd start
-sudo systemctl systemd-networkd enable
+sudo systemctl enable systemd-networkd
 exit # exit to host
 ```
 
