@@ -10,41 +10,41 @@ There is only one inode per block group and one descriptor block per group. The 
 DO NOT run directly on your machine. This is so that you do not brick your system. The recommended way to install is inside a VM. A dummy Vagrantfile is provided to easily provision one locally.
 
 ## Setting up
-Clone the source
+### Using the provided Vagrantfile to run the setup
 ```
-git clone https://github.com/misachi/ext0fs.git
-```
-
-Create a file to map to our "pseudo device"
-```
-dd if=/dev/zero of=/tmp/test.img bs=1M count=100
+vagrant up  # when ran the first time
 ```
 
-By default `/dev/loop0` device is chosen. Run `losetup -f` to get an unused device and set it in the Makefile `LOOP_DEV`
-
-Next steps will require `sudo` access, which makes provisioning a VM the best option:
+## Issues with setting up
+If you encounter an issue with networking as below
 ```
-sudo make run
-sudo make mount
-```
-
-A directory `testdir` will be created in your current path. This is the mounted filesystem for EXT0-fs. To access it you will need to be root
-```
-sudo su
-cd testdir
+No renderers compatible with netplan are available on guest. Please install
+a compatible renderer.
 ```
 
-Once you are able to `cd` into it, you can play around with the filesystem
+This can be fixed with the following steps
+
+First, ssh into the VM
 ```
-mkdir test
-cd test
-ls -la  # etc
+vagrant ssh
 ```
+Next, enable `systemd-networkd` service
+```
+sudo service systemd-networkd start
+sudo systemctl systemd-networkd enable
+exit # exit to host
+```
+
+Lastly, restart the VM
+```
+vagrant reload
+```
+
+Append the `--provision` flag if you need to re-run the setup commands
 
 ## Uninstallation
-To uninstall the filesystem
+To uninstall the filesystem(normal user)
 ```
-exit  # exit root -- Assuming you are still logged in as root
 sudo make unmount
 sudo make uninstall
 ```
