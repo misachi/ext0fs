@@ -18,7 +18,7 @@ Vagrant.configure("2") do |config|
       sudo apt update
       sudo apt -y install git make gcc
       git clone https://github.com/misachi/ext0fs.git
-      export VAGRANT_HOME=/home/vagrant/
+      export VAGRANT_HOME=/home/vagrant
       dd if=/dev/zero of=$VAGRANT_HOME/test.img bs=1M count=500
       sudo losetup /dev/loop9 $VAGRANT_HOME/test.img
       cd $VAGRANT_HOME/ext0fs

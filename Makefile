@@ -12,7 +12,7 @@ all:
 
 build_temp:
 	@mkdir -p $(EXT0_PROJECT)
-	@cp -R src $(EXT0_PROJECT)
+	@cp -uR src $(EXT0_PROJECT)
 	@cp Makefile $(EXT0_PROJECT)
 	@cd $(EXT0_PROJECT) && make
 
