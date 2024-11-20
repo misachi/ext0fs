@@ -35,9 +35,19 @@ sudo systemctl enable systemd-networkd
 exit # exit to host
 ```
 
-Lastly, restart the VM
+Lastly, restart the VM[Ignore compilation warnings]
 ```
 vagrant reload
+```
+
+The filesystem should now be mounted at `/home/vagrant/testdir`
+Try it out:
+```
+sudo su
+cd /home/vagrant/testdir
+mkdir dir1 dir2 dir3  # new directory
+ls -la  # directory details
+ls -i # get inode number
 ```
 
 Append the `--provision` flag if you need to re-run the setup commands
