@@ -27,7 +27,6 @@ mount:
 	@mount -o loop=$(LOOP_DEV) -t ext0 $(EXT0_TMP)/test.img $(MOUNT_POINT)
 
 unmount:
-	-umount -t ext0 $(EXT0_PROJECT)/$(MOUNT_POINT)
 	-umount -t ext0 $(MOUNT_POINT)
 
 run: mkfs
