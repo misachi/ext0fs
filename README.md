@@ -9,6 +9,10 @@ There is only one inode per block group and one descriptor block per group. The 
 
 DO NOT run directly on your machine. This is so that you do not brick your system. The recommended way to install is inside a VM. A dummy Vagrantfile is provided to easily provision one locally.
 
+Pending tasks:
+- Deleting directory
+- Renaming directory
+
 ## Setting up
 ### Using the provided Vagrantfile to run the setup
 ```
@@ -48,6 +52,9 @@ cd /home/vagrant/testdir
 mkdir dir1 dir2 dir3  # new directory
 ls -la  # directory details
 ls -i # get inode number
+touch file1
+nano file1 # write to file; ctrl+x to save
+ls -lai  # see entry details in the current directory
 ```
 
 Append the `--provision` flag if you need to re-run the setup commands
