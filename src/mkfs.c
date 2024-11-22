@@ -45,6 +45,7 @@ int main(int argc, char *argv[])
 
     blocks_per_group = EXT0_FS_MAX_DIRECT_BLOCKS + EXT0_GROUP_OVERHEAD_BLOCKS_NUM;
     group_count = (statinfo.st_size - (EXT0_FS_MIN_BLOCK_SIZE * EXT0_FS_OVERHEAD_BLOCKS)) / (EXT0_FS_MIN_BLOCK_SIZE * blocks_per_group);
+    // group_count = EXT0_INODE_BITMAP_SIZE;
     printf("fs_size=%li\ngroups=%zu\nblocks_per_group=%u\nlogical_block_size=%i\n\n", statinfo.st_size, group_count, blocks_per_group, EXT0_FS_MIN_BLOCK_SIZE);
 
     last_block = EXT0_GROUP_OVERHEAD_BLOCKS_NUM * group_count + EXT0_FS_OVERHEAD_BLOCKS;
@@ -140,6 +141,7 @@ int main(int argc, char *argv[])
     sb->s_inodes_per_group = 1;
     sb->s_magic = EXT0_FS_MAGIC;
     sb->s_blocks_count = EXT0_TO_LE32(statinfo.st_size / EXT0_FS_MIN_BLOCK_SIZE);
+    // sb->s_blocks_count = (group_count * blocks_per_group) + EXT0_FS_OVERHEAD_BLOCKS;
     sb->s_blocks_per_group = blocks_per_group;
     sb->s_inodes_count = sb->s_blocks_count;
     sb->s_free_inodes_count = sb->s_inodes_count - 1;

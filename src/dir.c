@@ -3,6 +3,8 @@
 
 #include "ext0.h"
 
+static int link_dir(struct inode *inode, struct dentry *dentry, umode_t mode);
+
 static int ext0_create_inode(struct inode *dir, struct dentry *dentry, umode_t mode, struct inode **ret_inode)
 {
 	struct super_block *sb = dir->i_sb;
@@ -38,7 +40,7 @@ retry:
 	inode->i_blocks = EXT0_FS_MAX_DIRECT_BLOCKS;
 	inode->i_flags = 0;
 	inode->i_state = EXT0_STATE_NEW | I_LINKABLE | I_NEW; /* The fs crashes without the I_NEW flag. Need to investigate */
-	inode->i_size = sizeof(struct ext0_inode);
+	inode->i_size = 0; // sizeof(struct ext0_inode);
 
 	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
 
@@ -94,14 +96,16 @@ static int ext0_new_inode(struct mnt_idmap *idmap, struct inode *dir, struct den
 	struct inode *inode = NULL;
 	int ret;
 
-	ret = ext0_create_inode(dir, dentry, mode, &inode);
+	unlock_new_inode(inode);
+	inode_inc_link_count(dir);
+	d_instantiate(dentry, inode);
+
+	ret = link_dir(dir, dentry, mode);
 	if (EXT0_IS_ERR(ret))
 	{
-		ext0_debug("Unable to create inode: %i", ret);
+		ext0_debug("Unable to link inode: %i", ret);
 		return ret;
 	}
-	unlock_new_inode(inode);
-	d_instantiate(dentry, inode);
 	return 0;
 }
 
@@ -129,6 +133,13 @@ static int ext0_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry 
 		mark_inode_dirty(inode);
 		unlock_new_inode(inode);
 		d_instantiate(dentry, inode);
+
+		ret = link_dir(dir, dentry, mode);
+		if (EXT0_IS_ERR(ret))
+		{
+			ext0_debug("Unable to link inode: %i", ret);
+			return ret;
+		}
 	}
 	return ret;
 }
@@ -158,12 +169,14 @@ static int ext0_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentr
 	return 0;
 }
 
-static int link_dir(struct inode *inode, struct dentry *dentry)
+static int link_dir(struct inode *inode, struct dentry *dentry, umode_t mode)
 {
+	unsigned long npages = dir_pages(dir);
+	struct inode *inode = d_inode(dentry);
 	unsigned long npages = dir_pages(inode);
-	// struct page *page;
 	struct ext0_dir_entry *de;
 	unsigned long i;
+	int d_type;
 
 	for (i = 0; i < npages; i++)
 	{
@@ -192,10 +205,16 @@ static int link_dir(struct inode *inode, struct dentry *dentry)
 				de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
 				memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
 				de->inode = cpu_to_le32(inode->i_ino);
-				de->file_type = DT_DIR;
 
-				inode->i_size += de->rec_len;
-				mark_inode_dirty(inode);
+				if(S_ISREG(mode))
+					d_type = S_IFREG;
+				else if(S_ISDIR(mode))
+					d_type = S_IFDIR;
+
+				de->file_type = d_type;
+
+				dir->i_size += de->rec_len;
+				mark_inode_dirty(dir);
 				return 0;
 			}
 
@@ -226,7 +245,9 @@ static int ext0_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry 
 
 	inode_inc_link_count(dir);
 
-	ret = ext0_create_inode(dir, dentry, S_IFDIR | mode, &inode);
+	mode |= S_IFDIR;
+
+	ret = ext0_create_inode(dir, dentry, mode, &inode);
 	if (EXT0_IS_ERR(ret) || !inode)
 	{
 		ext0_debug("Unable to create inode: %i", ret);
@@ -275,11 +296,6 @@ static int ext0_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry 
 	inode->i_size += de->rec_len;
 	mark_inode_dirty(inode);
 
-	ret = link_dir(dir, dentry);
-	if (EXT0_IS_ERR(ret))
-	{
-		goto k_err;
-	}
 	kunmap_local(kaddr);
 	block_write_end(NULL, inode->i_mapping, 0, chunk_size, chunk_size, &folio->page, NULL);
 	/* Default directory contents creation done */
@@ -312,6 +328,12 @@ static int ext0_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry 
 
 	unlock_new_inode(inode);
 	d_instantiate(dentry, inode);
+
+	ret = link_dir(dir, dentry, mode);
+	if (EXT0_IS_ERR(ret))
+	{
+		goto k_err;
+	}
 
 	folio_put(folio);
 
@@ -389,13 +411,9 @@ static int ext0_unlink(struct inode *dir, struct dentry *dentry)
 					return ret;
 				}
 				de->inode = 0;
+				dir->i_size -= de->rec_len;
+				memset(de, 0, de->rec_len);
 				block_write_end(NULL, inode->i_mapping, page_off, chunk_size, chunk_size, &folio->page, NULL);
-
-				if ((page_off + chunk_size) > dir->i_size)
-				{
-					i_size_write(dir, page_off + chunk_size);
-					mark_inode_dirty(dir);
-				}
 
 				folio_unlock(folio);
 				inode->i_ctime = inode->i_mtime = current_time(inode);
@@ -517,7 +535,7 @@ static int ext0_inode_by_name(struct dentry *dentry)
 	return 0;
 }
 
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 static inline void ext0_put_page(struct page *page, void *addr)
 {
 	kunmap_local(addr);
@@ -534,7 +552,7 @@ static struct page *ext0_get_page(struct inode *dir, unsigned long n, void **kad
 	return &folio->page;
 }
 
-static int ext0_new_inode(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
+static int ext0_new_inode(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct inode *inode = NULL;
 	int ret;
@@ -546,7 +564,15 @@ static int ext0_new_inode(struct user_namespace * mnt_userns, struct inode *dir,
 		return ret;
 	}
 	unlock_new_inode(inode);
+	inode_inc_link_count(dir);
 	d_instantiate(dentry, inode);
+
+	ret = link_dir(dir, dentry, mode);
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to link inode: %i", ret);
+		return ret;
+	}
 	return 0;
 }
 
@@ -564,7 +590,7 @@ static int ext0_tmpfile(struct user_namespace *mnt_userns, struct inode *dir, st
 	return finish_open_simple(file, 0);
 }
 
-static int ext0_mknod(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
+static int ext0_mknod(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	struct inode *inode = NULL;
 	int ret = ext0_create_inode(dir, dentry, mode, &inode);
@@ -574,11 +600,18 @@ static int ext0_mknod(struct user_namespace * mnt_userns, struct inode *dir, str
 		mark_inode_dirty(inode);
 		unlock_new_inode(inode);
 		d_instantiate(dentry, inode);
+
+		ret = link_dir(dir, dentry, mode);
+		if (EXT0_IS_ERR(ret))
+		{
+			ext0_debug("Unable to link inode: %i", ret);
+			return ret;
+		}
 	}
 	return ret;
 }
 
-static int ext0_symlink(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, const char *symname)
+static int ext0_symlink(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, const char *symname)
 {
 	struct inode *inode = NULL;
 	int ret = ext0_create_inode(dir, dentry, S_IFLNK | 0777, &inode);
@@ -603,19 +636,21 @@ static int ext0_symlink(struct user_namespace * mnt_userns, struct inode *dir, s
 	return 0;
 }
 
-static int link_dir(struct inode *inode, struct dentry *dentry)
+static int link_dir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	unsigned long npages = dir_pages(inode);
+	unsigned long npages = dir_pages(dir);
+	struct inode *inode = d_inode(dentry);
 	struct page *page;
 	struct ext0_dir_entry *de;
 	unsigned long i;
+	int d_type;
 
 	for (i = 0; i < npages; i++)
 	{
 		unsigned long page_off = 0, page_end;
 		void *kaddr;
 
-		page = ext0_get_page(inode, i, &kaddr);
+		page = ext0_get_page(dir, i, &kaddr);
 		if (!page)
 		{
 			ext0_debug("Invalid page while reading directory contents: page id=%zu", i);
@@ -636,10 +671,16 @@ static int link_dir(struct inode *inode, struct dentry *dentry)
 				de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
 				memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
 				de->inode = cpu_to_le32(inode->i_ino);
-				de->file_type = DT_DIR;
+
+				if(S_ISREG(mode))
+					d_type = S_IFREG;
+				else if(S_ISDIR(mode))
+					d_type = S_IFDIR;
+
+				de->file_type = d_type;
 
 				inode->i_size += de->rec_len;
-				mark_inode_dirty(inode);
+				mark_inode_dirty(dir);
 				return 0;
 			}
 
@@ -651,7 +692,7 @@ static int link_dir(struct inode *inode, struct dentry *dentry)
 	return -ENOSPC; /* We need to map new pages in */
 }
 
-static int ext0_mkdir(struct user_namespace * mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode)
+static int ext0_mkdir(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode = NULL;
 	struct buffer_head *bitmap_bh, *gdesc_bh;
@@ -669,7 +710,9 @@ static int ext0_mkdir(struct user_namespace * mnt_userns, struct inode *dir, str
 
 	inode_inc_link_count(dir);
 
-	ret = ext0_create_inode(dir, dentry, S_IFDIR | mode, &inode);
+	mode |= S_IFDIR;
+
+	ret = ext0_create_inode(dir, dentry, mode, &inode);
 	if (EXT0_IS_ERR(ret) || !inode)
 	{
 		ext0_debug("Unable to create inode: %i", ret);
@@ -717,11 +760,6 @@ static int ext0_mkdir(struct user_namespace * mnt_userns, struct inode *dir, str
 	inode->i_size += de->rec_len;
 	mark_inode_dirty(inode);
 
-	ret = link_dir(dir, dentry);
-	if (EXT0_IS_ERR(ret))
-	{
-		goto k_err;
-	}
 	kunmap_atomic(kaddr);
 	block_write_end(NULL, inode->i_mapping, 0, chunk_size, chunk_size, page, NULL);
 	/* Default directory contents creation done */
@@ -755,6 +793,12 @@ static int ext0_mkdir(struct user_namespace * mnt_userns, struct inode *dir, str
 	unlock_new_inode(inode);
 	d_instantiate(dentry, inode);
 
+	ret = link_dir(dir, dentry, mode);
+	if (EXT0_IS_ERR(ret))
+	{
+		goto k_err;
+	}
+
 	put_page(page);
 
 	return 0;
@@ -772,7 +816,7 @@ err:
 	return ret;
 }
 
-static int ext0_rename(struct user_namespace * mnt_userns, struct inode *old_dir, struct dentry *old_dentry,
+static int ext0_rename(struct user_namespace *mnt_userns, struct inode *old_dir, struct dentry *old_dentry,
 					   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
 {
 	return 0;
@@ -830,13 +874,9 @@ static int ext0_unlink(struct inode *dir, struct dentry *dentry)
 					goto out;
 				}
 				de->inode = 0;
+				dir->i_size -= de->rec_len;
+				memset(de, 0, de->rec_len);
 				block_write_end(NULL, inode->i_mapping, page_off, chunk_size, chunk_size, page, NULL);
-
-				if ((page_off + chunk_size) > dir->i_size)
-				{
-					i_size_write(dir, page_off + chunk_size);
-					mark_inode_dirty(dir);
-				}
 
 				unlock_page(page);
 				inode->i_ctime = inode->i_mtime = current_time(inode);
@@ -847,7 +887,7 @@ static int ext0_unlink(struct inode *dir, struct dentry *dentry)
 		ext0_put_page(page, kaddr);
 	}
 
-	inode_inc_link_count(inode);
+	inode_dec_link_count(inode);
 	mark_inode_dirty(inode);
 	return 0;
 out:
@@ -985,7 +1025,15 @@ static int ext0_new_inode(struct inode *dir, struct dentry *dentry, umode_t mode
 		return ret;
 	}
 	unlock_new_inode(inode);
+	inode_inc_link_count(dir);
 	d_instantiate(dentry, inode);
+
+	ret = link_dir(dir, dentry, mode);
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to link inode: %i", ret);
+		return ret;
+	}
 	return 0;
 }
 
@@ -1013,6 +1061,13 @@ static int ext0_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, de
 		mark_inode_dirty(inode);
 		unlock_new_inode(inode);
 		d_instantiate(dentry, inode);
+
+		ret = link_dir(dir, dentry, mode);
+		if (EXT0_IS_ERR(ret))
+		{
+			ext0_debug("Unable to link inode: %i", ret);
+			return ret;
+		}
 	}
 	return ret;
 }
@@ -1042,19 +1097,21 @@ static int ext0_symlink(struct inode *dir, struct dentry *dentry, const char *sy
 	return 0;
 }
 
-static int link_dir(struct inode *inode, struct dentry *dentry)
+static int link_dir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
-	unsigned long npages = dir_pages(inode);
+	unsigned long npages = dir_pages(dir);
+	struct inode *inode = d_inode(dentry);
 	struct page *page;
 	struct ext0_dir_entry *de;
 	unsigned long i;
+	int d_type;
 
 	for (i = 0; i < npages; i++)
 	{
 		unsigned long page_off = 0, page_end;
 		char *kaddr;
 
-		page = ext0_get_page(inode, i);
+		page = ext0_get_page(dir, i);
 		if (!page)
 		{
 			ext0_debug("Invalid page while reading directory contents: page id=%zu", i);
@@ -1075,10 +1132,16 @@ static int link_dir(struct inode *inode, struct dentry *dentry)
 				de->rec_len = EXT0_ALIGN_TO_SIZE(EXT0_DIR_SIZE + de->name_len);
 				memcpy(de->name, dentry->d_name.name, dentry->d_name.len);
 				de->inode = cpu_to_le32(inode->i_ino);
-				de->file_type = DT_DIR;
 
-				inode->i_size += de->rec_len;
-				mark_inode_dirty(inode);
+				if(S_ISREG(mode))
+					d_type = S_IFREG;
+				else if(S_ISDIR(mode))
+					d_type = S_IFDIR;
+
+				de->file_type = d_type;
+
+				dir->i_size += de->rec_len;
+				mark_inode_dirty(dir);
 				return 0;
 			}
 
@@ -1106,9 +1169,11 @@ static int ext0_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	void *kaddr;
 	unsigned long blk_no = 0;
 
-	inode_inc_link_count(dir);
+	inode_inc_link_count(dir); /* Link to parent  */
 
-	ret = ext0_create_inode(dir, dentry, S_IFDIR | mode, &inode);
+	mode |= S_IFDIR;
+
+	ret = ext0_create_inode(dir, dentry, mode, &inode);
 	if (EXT0_IS_ERR(ret) || !inode)
 	{
 		ext0_debug("Unable to create inode: %i", ret);
@@ -1156,11 +1221,6 @@ static int ext0_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	inode->i_size += de->rec_len;
 	mark_inode_dirty(inode);
 
-	ret = link_dir(dir, dentry);
-	if (EXT0_IS_ERR(ret))
-	{
-		goto k_err;
-	}
 	kunmap_atomic(kaddr);
 	block_write_end(NULL, inode->i_mapping, 0, chunk_size, chunk_size, page, NULL);
 	/* Default directory contents creation done */
@@ -1192,10 +1252,16 @@ static int ext0_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	mark_buffer_dirty(bitmap_bh);
 
 	unlock_new_inode(inode);
-	d_instantiate(dentry, inode);
 
 	put_page(page);
 
+	d_instantiate(dentry, inode);
+
+	ret = link_dir(dir, dentry, mode);
+	if (EXT0_IS_ERR(ret))
+	{
+		goto k_err;
+	}
 	return 0;
 
 k_err:
@@ -1268,13 +1334,10 @@ static int ext0_unlink(struct inode *dir, struct dentry *dentry)
 					goto out;
 				}
 				de->inode = 0;
-				block_write_end(NULL, inode->i_mapping, page_off, chunk_size, chunk_size, page, NULL);
+				dir->i_size -= de->rec_len;
+				memset(de, 0, de->rec_len);
 
-				if ((page_off + chunk_size) > dir->i_size)
-				{
-					i_size_write(dir, page_off + chunk_size);
-					mark_inode_dirty(dir);
-				}
+				block_write_end(NULL, inode->i_mapping, page_off, chunk_size, chunk_size, page, NULL);
 
 				unlock_page(page);
 				inode->i_ctime = inode->i_mtime = current_time(inode);
@@ -1285,7 +1348,7 @@ static int ext0_unlink(struct inode *dir, struct dentry *dentry)
 		ext0_put_page(page);
 	}
 
-	inode_inc_link_count(inode);
+	inode_dec_link_count(inode);
 	mark_inode_dirty(inode);
 	return 0;
 out:
@@ -1410,7 +1473,7 @@ static struct dentry *ext0_lookup_by_name(struct inode *dir, struct dentry *dent
 	if (ino)
 	{
 		inode = ext0_iget(dir->i_sb, ino);
-		if (inode == ERR_PTR(-ESTALE))
+		if (inode == ERR_PTR(-EIO) || inode == ERR_PTR(-ENOMEM))
 		{
 			ext0_debug("deleted inode referenced: %lu", (unsigned long)ino);
 			return ERR_PTR(-EIO);
@@ -1427,10 +1490,19 @@ static int ext0_rmdir(struct inode *dir, struct dentry *dentry)
 static int ext0_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(old_dentry);
+	int ret;
+
 	inode->i_ctime = current_time(inode);
 	inode_inc_link_count(inode);
-	mark_inode_dirty(inode);
 	d_instantiate(dentry, inode);
+	ret = link_dir(d_inode(dentry->d_parent), dentry, d_inode(dentry)->i_mode); /* Regular file? */
+
+	if (EXT0_IS_ERR(ret))
+	{
+		ext0_debug("Unable to link inode: %i", ret);
+		return ret;
+	}
+	mark_inode_dirty(inode);
 	return 0;
 }
 

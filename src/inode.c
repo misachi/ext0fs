@@ -76,12 +76,10 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
     struct super_block *sb = inode->i_sb;
     struct ext0_super_block_info *in_mem_sb = EXT0_SB(sb);
     struct ext0_block_descriptor *gdesc;
-    struct buffer_head *bh, *dir_bh;
+    struct buffer_head *bh;
     unsigned blk_no;
     off_t offset = 0;
     unsigned long phys_start;
-
-    struct ext0_dir_entry *de;
 
     blk_no = ext0_inode_block(inode->i_ino) - 1;
     if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
@@ -90,15 +88,7 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
     bh = in_mem_sb->s_group_desc[EXT0_GET_INO(inode->i_ino)];
     gdesc = (struct ext0_block_descriptor *)(bh->b_data + offset);
 
-    if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
-        blk_no = fs_to_dev_block_num(sb, gdesc->bg_first_block, &offset);
-
-    dir_bh = sb_bread(sb, blk_no);
-    de = (struct ext0_dir_entry *)(dir_bh->b_data + offset);
-
     spin_lock(&in_mem_sb->s_lock);
-
-    ext0_debug("Now here we are=> iblock: %llu, create: %i, ino: %lu, grp desc first block: %u: root directory ino: %u, name: %s", iblock, create, inode->i_ino, gdesc->bg_first_block, de->inode, de->name);
 
     phys_start = gdesc->bg_first_block + iblock - 1;
     if (!create)
@@ -110,7 +100,11 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
 
     if (inode->i_blocks < (iblock + 1))
     {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
         ext0_debug("Invalid block number: %llu", iblock);
+#else
+        ext0_debug("Invalid block number: %lu", iblock);
+#endif
         spin_unlock(&in_mem_sb->s_lock);
         return -ENOSPC;
     }
@@ -128,11 +122,11 @@ const struct address_space_operations ext0_aops = {
     .invalidate_folio = block_invalidate_folio,
     .error_remove_folio = generic_error_remove_folio,
     .migrate_folio = buffer_migrate_folio,
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
     .read_folio = ext0_read_folio,
     .dirty_folio = block_dirty_folio,
     .invalidate_folio = block_invalidate_folio,
-    .error_remove_page	= generic_error_remove_page,
+    .error_remove_page = generic_error_remove_page,
     .migrate_folio = buffer_migrate_folio,
 #else
     .readpage = ext0_readpage,
@@ -183,8 +177,6 @@ static struct ext0_inode *ext0_get_inode(struct super_block *sb, ino_t ino, stru
     if (EXT0_FS_MIN_BLOCK_SIZE < sb->s_blocksize)
         blk_no = fs_to_dev_block_num(sb, blk_no, &offset);
 
-    ext0_debug("get inode block: %zu, offset: %li, inode_no: %zu", blk_no, offset, ino);
-
     bh = sb_bread(sb, blk_no);
     if (!bh)
         return ERR_PTR(-EIO);
@@ -230,16 +222,15 @@ void ext0_evict_inode(struct inode *inode)
     struct ext0_inode_info *in_mem_inode = EXT0_I(inode);
     struct writeback_control wbc;
     struct super_block *sb = inode->i_sb;
+    struct ext0_super_block_info *in_mem_sb = EXT0_SB(sb);
     struct ext0_super_block *on_disk_sb = EXT0_SB(sb)->s_es;
-    unsigned long blk_no;
 
-    blk_no = ext0_inode_block(inode->i_ino) - 1;
-
-    ext0_test_and_clear_bit(blk_no, (void *)on_disk_sb->s_inode_bitmap);
+    ext0_test_and_clear_bit(EXT0_GET_INO(inode->i_ino), (void *)on_disk_sb->s_inode_bitmap);
 
     in_mem_inode->i_dtime = ktime_get_real_seconds();
     wbc.sync_mode = 1;
     ext0_write_inode(inode, &wbc);
+    mark_buffer_dirty(in_mem_sb->s_sbh);
 
     memset(in_mem_inode->i_data, 0, EXT0_FS_MAX_DIRECT_BLOCKS * sizeof(__le32));
     truncate_inode_pages_final(inode->i_mapping);
@@ -262,6 +253,8 @@ struct inode *ext0_iget(struct super_block *sb, ino_t ino)
 
     in_mem_inode = EXT0_I(inode);
     on_disk_inode = ext0_get_inode(sb, ino, &bh);
+    if (!on_disk_inode)
+        return ERR_PTR(-EIO);
 
     in_mem_inode->i_flags = le32_to_cpu(on_disk_inode->i_flags);
     in_mem_inode->i_block_group = ino;
