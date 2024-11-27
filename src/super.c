@@ -168,7 +168,7 @@ static int ext0_fill_super(struct super_block *sb, void *data, int silent)
     struct ext0_super_block *on_disk_sb;
     struct inode *root;
     struct buffer_head *bh, *desc_bh;
-    int ret = 0, groups_count;
+    int groups_count;
     off_t offset;
     unsigned long sb_block = EXT0_SUPER_BLOCK, desc_block;
     unsigned desc_group_no;
@@ -204,7 +204,7 @@ static int ext0_fill_super(struct super_block *sb, void *data, int silent)
         ext0_debug("Could not perform I/O for super block");
         sb->s_fs_info = NULL;
         kfree(in_mem_sb);
-        return -ENOMEM;
+        return -EIO;
     }
     on_disk_sb = (struct ext0_super_block *)(bh->b_data + offset);
 
@@ -255,11 +255,10 @@ static int ext0_fill_super(struct super_block *sb, void *data, int silent)
             }
 
             ext0_debug("Unable to perform I/O for descriptor index=%zu", i);
-            ret = -ENOMEM;
             brelse(bh);
             sb->s_fs_info = NULL;
             kfree(in_mem_sb);
-            return -ENOMEM;
+            return -EIO;
         }
 
         in_mem_sb->s_group_desc[i] = desc_bh;
@@ -283,7 +282,7 @@ static int ext0_fill_super(struct super_block *sb, void *data, int silent)
         ext0_debug("Unable to find root directory inode: %i", EXT0_ROOT_INO);
         brelse(bh);
         kfree(in_mem_sb);
-        return -ENOMEM;
+        return -EIO;
     }
 
     sb->s_root = d_make_root(root);
