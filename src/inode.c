@@ -100,11 +100,7 @@ int ext0_get_block(struct inode *inode, sector_t iblock,
 
     if (inode->i_blocks < (iblock + 1))
     {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-        ext0_debug("Invalid block number: %llu", iblock);
-#else
-        ext0_debug("Invalid block number: %lu", iblock);
-#endif
+        ext0_debug("Invalid block number: %llu", (unsigned long long)iblock);
         spin_unlock(&in_mem_sb->s_lock);
         return -ENOSPC;
     }
